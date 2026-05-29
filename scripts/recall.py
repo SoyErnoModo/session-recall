@@ -421,6 +421,11 @@ def main() -> int:
     parser.add_argument("--since", type=int, default=60, help="Lookback window in days (default 60).")
     parser.add_argument("--format", choices=["md", "json"], default="md")
     parser.add_argument("--verbose", action="store_true", help="No truncation of turns/files.")
+    parser.add_argument(
+        "--repo-only",
+        action="store_true",
+        help="Show only files under the current cwd repo (drop ~/.claude/* skill/memory edits).",
+    )
     args = parser.parse_args()
 
     topic = " ".join(args.topic).strip()
@@ -444,6 +449,18 @@ def main() -> int:
 
     matches.sort(key=lambda x: x.score, reverse=True)
     matches = matches[: args.limit]
+
+    if args.repo_only:
+        cwd_str = os.path.realpath(os.getcwd())
+        claude_home = os.path.realpath(os.path.expanduser("~/.claude"))
+        for m in matches:
+            m.files_touched = {
+                fp for fp in m.files_touched
+                if (
+                    os.path.realpath(fp).startswith(cwd_str)
+                    and not os.path.realpath(fp).startswith(claude_home)
+                )
+            }
 
     if args.format == "json":
         print(format_json(matches))
