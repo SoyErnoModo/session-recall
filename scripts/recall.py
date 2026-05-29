@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Any
 
 PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+CACHE_ROOT = Path.home() / ".cache" / "session-recall"
+CACHE_VERSION = 2  # bump when serialized shape changes
 
 # Markers that flag "pending work" in free-text.
 # Tightened 2026-05-29: require an action-context anchor (verb/noun pair) instead of
@@ -194,6 +196,161 @@ class SessionMatch:
 
 
 @dataclass
+class Digest:
+    """Parsed, query-independent extract of a single jsonl session.
+
+    Persisted to ~/.cache/session-recall/ keyed by jsonl path + mtime.
+    Query phase runs against the digest, not the raw transcript.
+    """
+    file_path: str = ""
+    mtime: float = 0.0
+    session_id: str = ""
+    ai_title: str = ""
+    first_ts: str = ""  # ISO
+    last_ts: str = ""
+    git_branch: str = ""
+    cwd: str = ""
+    files_touched: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    # turns: list of (iso_ts_or_empty, role, text)
+    turns: list[tuple[str, str, str]] = field(default_factory=list)
+
+
+def cache_path_for(jsonl_path: Path) -> Path:
+    """Stable cache location for a given jsonl path."""
+    digest_key = hashlib.sha1(str(jsonl_path).encode("utf-8")).hexdigest()[:16]
+    return CACHE_ROOT / f"{digest_key}.json"
+
+
+def digest_to_dict(d: Digest) -> dict:
+    return {
+        "_v": CACHE_VERSION,
+        "file_path": d.file_path,
+        "mtime": d.mtime,
+        "session_id": d.session_id,
+        "ai_title": d.ai_title,
+        "first_ts": d.first_ts,
+        "last_ts": d.last_ts,
+        "git_branch": d.git_branch,
+        "cwd": d.cwd,
+        "files_touched": d.files_touched,
+        "errors": d.errors,
+        "turns": d.turns,
+    }
+
+
+def dict_to_digest(d: dict) -> Digest:
+    return Digest(
+        file_path=d.get("file_path", ""),
+        mtime=d.get("mtime", 0.0),
+        session_id=d.get("session_id", ""),
+        ai_title=d.get("ai_title", ""),
+        first_ts=d.get("first_ts", ""),
+        last_ts=d.get("last_ts", ""),
+        git_branch=d.get("git_branch", ""),
+        cwd=d.get("cwd", ""),
+        files_touched=list(d.get("files_touched", [])),
+        errors=list(d.get("errors", [])),
+        turns=[tuple(t) for t in d.get("turns", [])],
+    )
+
+
+def parse_jsonl_to_digest(path: Path) -> Digest | None:
+    """Read a jsonl end-to-end and build a query-independent digest."""
+    d = Digest(
+        file_path=str(path),
+        mtime=path.stat().st_mtime,
+        session_id=path.stem,
+    )
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                t = ev.get("type")
+
+                if t == "ai-title":
+                    d.ai_title = ev.get("aiTitle") or d.ai_title
+                    continue
+
+                if t not in {"user", "assistant"}:
+                    continue
+
+                ts_obj = parse_ts(ev.get("timestamp"))
+                ts_iso = ts_obj.isoformat() if ts_obj else ""
+                if ts_obj:
+                    if not d.first_ts:
+                        d.first_ts = ts_iso
+                    d.last_ts = ts_iso
+
+                if not d.git_branch:
+                    d.git_branch = ev.get("gitBranch") or ""
+                if not d.cwd:
+                    d.cwd = ev.get("cwd") or ""
+
+                msg = ev.get("message")
+                if isinstance(msg, dict):
+                    c = msg.get("content")
+                    if isinstance(c, list):
+                        for b in c:
+                            if isinstance(b, dict) and b.get("type") == "tool_use":
+                                name = b.get("name") or ""
+                                if name in FILE_TOOLS:
+                                    inp = b.get("input", {}) or {}
+                                    fp = inp.get("file_path") or inp.get("notebook_path")
+                                    if fp and str(fp) not in d.files_touched:
+                                        d.files_touched.append(str(fp))
+                            if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
+                                err_text = block_text(b)[:200]
+                                if err_text and err_text not in d.errors:
+                                    d.errors.append(err_text)
+
+                text = event_text(ev)
+                if not text:
+                    continue
+
+                role = msg.get("role") if isinstance(msg, dict) else ""
+                d.turns.append((ts_iso, role or "", text))
+    except OSError:
+        return None
+    return d
+
+
+def load_or_build_digest(jsonl: Path, use_cache: bool = True) -> tuple[Digest | None, bool]:
+    """Return (digest, was_cache_hit)."""
+    cache_file = cache_path_for(jsonl)
+    if use_cache and cache_file.exists():
+        try:
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            if (
+                payload.get("_v") == CACHE_VERSION
+                and abs(payload.get("mtime", 0) - jsonl.stat().st_mtime) < 1e-3
+            ):
+                return dict_to_digest(payload), True
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    digest = parse_jsonl_to_digest(jsonl)
+    if digest is None:
+        return None, False
+    if use_cache:
+        try:
+            CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+            tmp = cache_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(digest_to_dict(digest), ensure_ascii=False), encoding="utf-8")
+            tmp.replace(cache_file)
+        except OSError:
+            pass
+    return digest, False
+
+
+@dataclass
 class Query:
     """Boolean keyword query: must (AND), should (OR), must_not (NOT)."""
     must: list[re.Pattern] = field(default_factory=list)
@@ -218,113 +375,71 @@ class Query:
         return " ".join(parts)
 
 
-def scan_jsonl(path: Path, query: Query, since: datetime | None) -> SessionMatch | None:
-    match = SessionMatch(path=path, session_id=path.stem)
+def match_digest(digest: Digest, query: Query, since: datetime | None) -> SessionMatch | None:
+    """Apply a query over a pre-parsed digest. Cheap — no jsonl IO."""
+    path = Path(digest.file_path)
+    match = SessionMatch(path=path, session_id=digest.session_id)
+    match.ai_title = digest.ai_title
+    match.git_branch = digest.git_branch
+    match.cwd = digest.cwd
+    match.files_touched = set(digest.files_touched)
+    match.errors = list(digest.errors)
+    match.first_ts = parse_ts(digest.first_ts) if digest.first_ts else None
+    match.last_ts = parse_ts(digest.last_ts) if digest.last_ts else None
+
     seen_hashes: set[str] = set()
     must_hits: set[int] = set()
     should_seen = False
     must_not_tripped = False
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+    for ts_iso, role, text in digest.turns:
+        ts = parse_ts(ts_iso) if ts_iso else None
+        if since and ts and ts < since:
+            continue
 
-                t = ev.get("type")
+        if role == "user":
+            if not match.first_user_msg:
+                match.first_user_msg = text[:500]
+            match.last_user_msg = text[:500]
+        elif role == "assistant":
+            match.last_assistant_msg = text[:500]
 
-                if t == "ai-title":
-                    match.ai_title = ev.get("aiTitle") or match.ai_title
-                    continue
+        if any(p.search(text) for p in query.must_not):
+            must_not_tripped = True
+            break
 
-                if t not in {"user", "assistant"}:
-                    continue
+        for idx, p in enumerate(query.must):
+            if p.search(text):
+                must_hits.add(idx)
 
-                ts = parse_ts(ev.get("timestamp"))
-                if since and ts and ts < since:
-                    continue
-                if ts:
-                    match.first_ts = match.first_ts or ts
-                    match.last_ts = ts
+        hit_patterns = query.turn_matches(text)
+        if not hit_patterns:
+            continue
+        if query.should and any(p.search(text) for p in query.should):
+            should_seen = True
 
-                if not match.git_branch:
-                    match.git_branch = ev.get("gitBranch") or ""
-                if not match.cwd:
-                    match.cwd = ev.get("cwd") or ""
+        h = hash_content(text)
+        if h in seen_hashes:
+            continue
+        seen_hashes.add(h)
 
-                msg = ev.get("message")
-                if isinstance(msg, dict):
-                    c = msg.get("content")
-                    if isinstance(c, list):
-                        for b in c:
-                            if isinstance(b, dict) and b.get("type") == "tool_use":
-                                name = b.get("name") or ""
-                                if name in FILE_TOOLS:
-                                    inp = b.get("input", {}) or {}
-                                    fp = inp.get("file_path") or inp.get("notebook_path")
-                                    if fp:
-                                        match.files_touched.add(str(fp))
-                            if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
-                                err_text = block_text(b)[:200]
-                                if err_text and err_text not in match.errors:
-                                    match.errors.append(err_text)
+        match.hits += 1
+        snippet = text
+        for p in hit_patterns:
+            snippet = p.sub(lambda m: f"**{m.group(0)}**", snippet)
+        snippet = snippet.strip()[:600]
 
-                text = event_text(ev)
-                if not text:
-                    continue
+        if role == "user":
+            match.matched_user_turns.append((ts, snippet))
+        else:
+            match.matched_assistant_turns.append((ts, snippet))
 
-                h = hash_content(text)
-                if h in seen_hashes:
-                    continue
-                seen_hashes.add(h)
-
-                role = msg.get("role") if isinstance(msg, dict) else None
-
-                if role == "user":
-                    if not match.first_user_msg:
-                        match.first_user_msg = text[:500]
-                    match.last_user_msg = text[:500]
-                elif role == "assistant":
-                    match.last_assistant_msg = text[:500]
-
-                if any(p.search(text) for p in query.must_not):
-                    must_not_tripped = True
-                    break
-
-                for idx, p in enumerate(query.must):
-                    if p.search(text):
-                        must_hits.add(idx)
-
-                hit_patterns = query.turn_matches(text)
-                if not hit_patterns:
-                    continue
-                if query.should and any(p.search(text) for p in query.should):
-                    should_seen = True
-
-                match.hits += 1
-                snippet = text
-                for p in hit_patterns:
-                    snippet = p.sub(lambda m: f"**{m.group(0)}**", snippet)
-                snippet = snippet.strip()[:600]
-
-                if role == "user":
-                    match.matched_user_turns.append((ts, snippet))
-                else:
-                    match.matched_assistant_turns.append((ts, snippet))
-
-                for line_text in text.splitlines():
-                    if any(p.search(line_text) for p in DECISION_PATTERNS) and role == "assistant":
-                        if line_text.strip() not in match.decisions:
-                            match.decisions.append(line_text.strip()[:300])
-                    if any(p.search(line_text) for p in PENDING_PATTERNS):
-                        if line_text.strip() not in match.pendings:
-                            match.pendings.append(line_text.strip()[:300])
-    except OSError:
-        return None
+        for line_text in text.splitlines():
+            if any(p.search(line_text) for p in DECISION_PATTERNS) and role == "assistant":
+                if line_text.strip() not in match.decisions:
+                    match.decisions.append(line_text.strip()[:300])
+            if any(p.search(line_text) for p in PENDING_PATTERNS):
+                if line_text.strip() not in match.pendings:
+                    match.pendings.append(line_text.strip()[:300])
 
     if must_not_tripped:
         return None
@@ -488,7 +603,30 @@ def main() -> int:
         action="store_true",
         help="Show only files under the current cwd repo (drop ~/.claude/* skill/memory edits).",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Skip the on-disk digest cache (~/.cache/session-recall/) and re-parse every jsonl.",
+    )
+    parser.add_argument(
+        "--cache-clear",
+        action="store_true",
+        help="Delete the cache before running.",
+    )
+    parser.add_argument(
+        "--cache-stats",
+        action="store_true",
+        help="Print cache hit/miss stats to stderr at the end.",
+    )
     args = parser.parse_args()
+
+    if args.cache_clear:
+        if CACHE_ROOT.exists():
+            for p in CACHE_ROOT.glob("*.json"):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
 
     terms = [t.strip() for t in args.topic if t.strip()]
     if not terms:
@@ -515,12 +653,18 @@ def main() -> int:
 
     project_dirs = resolve_project_dirs(args)
     matches: list[SessionMatch] = []
+    cache_hits = cache_misses = 0
 
     for pdir in project_dirs:
         if not pdir.exists():
             continue
         for jsonl in pdir.glob("*.jsonl"):
-            m = scan_jsonl(jsonl, query, since)
+            digest, was_hit = load_or_build_digest(jsonl, use_cache=not args.no_cache)
+            if digest is None:
+                continue
+            cache_hits += int(was_hit)
+            cache_misses += int(not was_hit)
+            m = match_digest(digest, query, since)
             if m:
                 matches.append(m)
 
@@ -543,6 +687,14 @@ def main() -> int:
         print(format_json(matches))
     else:
         print(format_markdown(matches, display_topic, args.verbose))
+
+    if args.cache_stats:
+        total = cache_hits + cache_misses
+        rate = (cache_hits / total * 100) if total else 0.0
+        print(
+            f"\ncache: {cache_hits} hit / {cache_misses} miss / {total} total ({rate:.1f}% hit)",
+            file=sys.stderr,
+        )
     return 0
 
 
