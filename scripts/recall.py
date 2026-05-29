@@ -193,9 +193,37 @@ class SessionMatch:
         return self.hits + recency_bonus * 5
 
 
-def scan_jsonl(path: Path, pattern: re.Pattern, since: datetime | None) -> SessionMatch | None:
+@dataclass
+class Query:
+    """Boolean keyword query: must (AND), should (OR), must_not (NOT)."""
+    must: list[re.Pattern] = field(default_factory=list)
+    should: list[re.Pattern] = field(default_factory=list)
+    must_not: list[re.Pattern] = field(default_factory=list)
+
+    def highlight_patterns(self) -> list[re.Pattern]:
+        return self.must + self.should
+
+    def turn_matches(self, text: str) -> list[re.Pattern]:
+        """Return positive patterns (must|should) that fired in this turn."""
+        return [p for p in self.highlight_patterns() if p.search(text)]
+
+    def display(self) -> str:
+        parts: list[str] = []
+        if self.must:
+            parts.append("AND(" + ", ".join(p.pattern for p in self.must) + ")")
+        if self.should:
+            parts.append("OR(" + ", ".join(p.pattern for p in self.should) + ")")
+        if self.must_not:
+            parts.append("NOT(" + ", ".join(p.pattern for p in self.must_not) + ")")
+        return " ".join(parts)
+
+
+def scan_jsonl(path: Path, query: Query, since: datetime | None) -> SessionMatch | None:
     match = SessionMatch(path=path, session_id=path.stem)
     seen_hashes: set[str] = set()
+    must_hits: set[int] = set()
+    should_seen = False
+    must_not_tripped = False
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -263,11 +291,24 @@ def scan_jsonl(path: Path, pattern: re.Pattern, since: datetime | None) -> Sessi
                 elif role == "assistant":
                     match.last_assistant_msg = text[:500]
 
-                if not pattern.search(text):
+                if any(p.search(text) for p in query.must_not):
+                    must_not_tripped = True
+                    break
+
+                for idx, p in enumerate(query.must):
+                    if p.search(text):
+                        must_hits.add(idx)
+
+                hit_patterns = query.turn_matches(text)
+                if not hit_patterns:
                     continue
+                if query.should and any(p.search(text) for p in query.should):
+                    should_seen = True
 
                 match.hits += 1
-                snippet = pattern.sub(lambda m: f"**{m.group(0)}**", text)
+                snippet = text
+                for p in hit_patterns:
+                    snippet = p.sub(lambda m: f"**{m.group(0)}**", snippet)
                 snippet = snippet.strip()[:600]
 
                 if role == "user":
@@ -285,6 +326,12 @@ def scan_jsonl(path: Path, pattern: re.Pattern, since: datetime | None) -> Sessi
     except OSError:
         return None
 
+    if must_not_tripped:
+        return None
+    if query.must and len(must_hits) < len(query.must):
+        return None
+    if query.should and not should_seen:
+        return None
     if match.hits == 0:
         return None
     return match
@@ -413,8 +460,23 @@ def format_json(matches: list[SessionMatch]) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Recall past Claude Code sessions by topic.")
-    parser.add_argument("topic", nargs="+", help="Keyword or phrase to search.")
+    parser = argparse.ArgumentParser(
+        description="Recall past Claude Code sessions by topic.",
+        epilog=(
+            "Boolean examples:\n"
+            "  recall.py 'Next 16' 'CSP' --and       # both must match\n"
+            "  recall.py 'Next 16' 'CSP'             # either matches (OR, default)\n"
+            "  recall.py 'Next 16' --not legacy      # match Next 16, drop sessions mentioning legacy\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("topic", nargs="+", help="Keyword or phrase to search. Pass multiple for OR.")
+    parser.add_argument("--and", dest="require_all", action="store_true",
+                        help="Require ALL topic terms to match (AND instead of OR).")
+    parser.add_argument("--not", dest="exclude", action="append", default=[],
+                        help="Exclude sessions matching this term (repeatable).")
+    parser.add_argument("--regex", action="store_true",
+                        help="Treat topic terms and --not values as regex (not literal).")
     parser.add_argument("--all", action="store_true", help="Search across all projects.")
     parser.add_argument("--project", help="Project slug under ~/.claude/projects/")
     parser.add_argument("--limit", type=int, default=5, help="Top-N sessions (default 5).")
@@ -428,12 +490,27 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    topic = " ".join(args.topic).strip()
-    if not topic:
+    terms = [t.strip() for t in args.topic if t.strip()]
+    if not terms:
         print("error: empty topic", file=sys.stderr)
         return 2
 
-    pattern = re.compile(re.escape(topic), re.IGNORECASE)
+    def compile_term(s: str) -> re.Pattern:
+        return re.compile(s if args.regex else re.escape(s), re.IGNORECASE)
+
+    query = Query()
+    if args.require_all:
+        query.must = [compile_term(t) for t in terms]
+    else:
+        query.should = [compile_term(t) for t in terms]
+    query.must_not = [compile_term(t) for t in args.exclude]
+
+    display_topic = " ".join(f'"{t}"' for t in terms)
+    if args.require_all and len(terms) > 1:
+        display_topic = " AND ".join(f'"{t}"' for t in terms)
+    if args.exclude:
+        display_topic += " NOT " + " ".join(f'"{e}"' for e in args.exclude)
+
     since = datetime.now(timezone.utc) - timedelta(days=args.since) if args.since else None
 
     project_dirs = resolve_project_dirs(args)
@@ -443,7 +520,7 @@ def main() -> int:
         if not pdir.exists():
             continue
         for jsonl in pdir.glob("*.jsonl"):
-            m = scan_jsonl(jsonl, pattern, since)
+            m = scan_jsonl(jsonl, query, since)
             if m:
                 matches.append(m)
 
@@ -465,7 +542,7 @@ def main() -> int:
     if args.format == "json":
         print(format_json(matches))
     else:
-        print(format_markdown(matches, topic, args.verbose))
+        print(format_markdown(matches, display_topic, args.verbose))
     return 0
 
 
