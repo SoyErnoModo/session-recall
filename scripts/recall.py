@@ -29,7 +29,6 @@ import json
 import os
 import re
 import sys
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -204,6 +203,7 @@ class Digest:
     """
     file_path: str = ""
     mtime: float = 0.0
+    size: int = 0
     session_id: str = ""
     ai_title: str = ""
     first_ts: str = ""  # ISO
@@ -227,6 +227,7 @@ def digest_to_dict(d: Digest) -> dict:
         "_v": CACHE_VERSION,
         "file_path": d.file_path,
         "mtime": d.mtime,
+        "size": d.size,
         "session_id": d.session_id,
         "ai_title": d.ai_title,
         "first_ts": d.first_ts,
@@ -243,6 +244,7 @@ def dict_to_digest(d: dict) -> Digest:
     return Digest(
         file_path=d.get("file_path", ""),
         mtime=d.get("mtime", 0.0),
+        size=int(d.get("size", 0)),
         session_id=d.get("session_id", ""),
         ai_title=d.get("ai_title", ""),
         first_ts=d.get("first_ts", ""),
@@ -257,9 +259,11 @@ def dict_to_digest(d: dict) -> Digest:
 
 def parse_jsonl_to_digest(path: Path) -> Digest | None:
     """Read a jsonl end-to-end and build a query-independent digest."""
+    st = path.stat()
     d = Digest(
         file_path=str(path),
-        mtime=path.stat().st_mtime,
+        mtime=st.st_mtime,
+        size=st.st_size,
         session_id=path.stem,
     )
     try:
@@ -328,9 +332,11 @@ def load_or_build_digest(jsonl: Path, use_cache: bool = True) -> tuple[Digest | 
     if use_cache and cache_file.exists():
         try:
             payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            st = jsonl.stat()
             if (
                 payload.get("_v") == CACHE_VERSION
-                and abs(payload.get("mtime", 0) - jsonl.stat().st_mtime) < 1e-3
+                and abs(payload.get("mtime", 0) - st.st_mtime) < 1e-3
+                and int(payload.get("size", -1)) == st.st_size
             ):
                 return dict_to_digest(payload), True
         except (json.JSONDecodeError, OSError):
