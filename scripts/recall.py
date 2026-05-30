@@ -462,9 +462,17 @@ def match_digest(digest: Digest, query: Query, since: datetime | None) -> Sessio
         seen_hashes.add(h)
 
         match.hits += 1
-        snippet = text
-        for p in hit_patterns:
-            snippet = p.sub(lambda m: f"**{m.group(0)}**", snippet)
+        # Single-pass highlight to avoid double-wrapping when patterns overlap
+        # (e.g. ["Next", "Next 16"] against "Next 16 release" should not become
+        # `**Next** 16` then `**Next 16**` → `****Next 16**`).
+        if hit_patterns:
+            combined = re.compile(
+                "|".join(p.pattern for p in hit_patterns),
+                hit_patterns[0].flags,
+            )
+            snippet = combined.sub(lambda m: f"**{m.group(0)}**", text)
+        else:
+            snippet = text
         snippet = snippet.strip()[:600]
 
         if role == "user":
@@ -672,8 +680,21 @@ def main() -> int:
         print("error: empty topic", file=sys.stderr)
         return 2
 
+    # Warn on logically empty queries (same term in positional and --not).
+    overlap = set(t.lower() for t in terms) & set(e.lower() for e in args.exclude)
+    if overlap:
+        print(
+            f"warning: term(s) appear in both topic and --not: {sorted(overlap)} — "
+            f"query will return zero matches.",
+            file=sys.stderr,
+        )
+
     def compile_term(s: str) -> re.Pattern:
-        return re.compile(s if args.regex else re.escape(s), re.IGNORECASE)
+        try:
+            return re.compile(s if args.regex else re.escape(s), re.IGNORECASE)
+        except re.error as exc:
+            print(f"error: invalid regex {s!r}: {exc}", file=sys.stderr)
+            sys.exit(2)
 
     query = Query()
     if args.require_all:
@@ -682,13 +703,21 @@ def main() -> int:
         query.should = [compile_term(t) for t in terms]
     query.must_not = [compile_term(t) for t in args.exclude]
 
-    display_topic = " ".join(f'"{t}"' for t in terms)
+    # Build a readable display string. Multiple --not values render as
+    # `NOT "A" NOT "B"` instead of the ambiguous `NOT "A" "B"`.
     if args.require_all and len(terms) > 1:
         display_topic = " AND ".join(f'"{t}"' for t in terms)
+    else:
+        display_topic = " ".join(f'"{t}"' for t in terms)
     if args.exclude:
-        display_topic += " NOT " + " ".join(f'"{e}"' for e in args.exclude)
+        display_topic += "".join(f' NOT "{e}"' for e in args.exclude)
 
-    since = datetime.now(timezone.utc) - timedelta(days=args.since) if args.since else None
+    # --since=0 means "today only" (sessions from the last 0 days = today).
+    # Treat negative as invalid; the `is None` guard handles `--since` omitted.
+    if args.since < 0:
+        print(f"error: --since must be >= 0, got {args.since}", file=sys.stderr)
+        return 2
+    since = datetime.now(timezone.utc) - timedelta(days=args.since)
 
     project_dirs = resolve_project_dirs(args)
     matches: list[SessionMatch] = []
