@@ -39,10 +39,26 @@ CACHE_ROOT = Path.home() / ".cache" / "session-recall"
 CACHE_VERSION = 2  # bump when serialized shape changes
 
 # Markers that flag "pending work" in free-text.
-# Tightened 2026-05-29: require an action-context anchor (verb/noun pair) instead of
-# matching `queda`/`falta` mid-sentence as standalone words.
-# Why: in real transcripts "queda" matched "lo que queda dicho", "Listo, queda así" —
-# noise. Now we demand the marker is followed by something that looks like a task.
+#
+# v1 → v2 (2026-05-29) tightened anchors to drop `queda`/`falta` mid-sentence
+# false positives ("Listo, queda así", "lo que queda dicho").
+# v2 → v3 (2026-05-30) broadened the action-verb whitelist after audit found
+# real-world phrasings being dropped (`falta probar/arreglar/documentar`,
+# `queda chequear/revisar`). Checkbox restored to v1's bare `[ ]` form so
+# non-dash bullets (`* [ ]`, `1. [ ]`, indented `[ ]`) also match.
+#
+# Design: anchor word + ≤3 words of slack + action verb. The verb list is
+# DRY-shared between `queda` and `falta` via `_PENDING_VERBS`.
+_PENDING_VERBS = (
+    "hacer|implementar|wirear|validar|revisar|testear|merge|mergear|deployar|"
+    "pushear|escribir|crear|completar|terminar|cerrar|chequear|investigar|"
+    "probar|arreglar|documentar|corregir|agregar|poner|subir|migrar|publicar|"
+    "actualizar|configurar|ajustar|conectar|definir|aprobar"
+)
+# Conjunctions (por, pendiente) are NOT verbs — they would let "queda así
+# por ahora" trip as a false positive. `queda por <verb>` still matches
+# because the regex allows 0-3 slack words before the action verb.
+
 PENDING_PATTERNS = [
     re.compile(r"\bTODO\b[: ]", re.I),
     re.compile(r"\bPENDING\b[: ]", re.I),
@@ -50,14 +66,17 @@ PENDING_PATTERNS = [
     re.compile(r"\bTBD\b\)?", re.I),
     re.compile(r"\bsin terminar\b", re.I),
     re.compile(r"\bquedó? pendiente\b", re.I),
-    re.compile(r"\bqueda\s+(por|pendiente|hacer|para)\b", re.I),
-    re.compile(r"\bfalta(?:n|ría|rían)?\s+(?:que\s+)?(?:\w+\s+){0,3}\b(?:hacer|implementar|wirear|validar|revisar|testear|merge|mergear|deployar|pushear|escribir|crear|completar|terminar|cerrar|chequear|investigar)\b", re.I),
+    re.compile(rf"\bqueda\s+(?:\w+\s+){{0,3}}(?:{_PENDING_VERBS})\b", re.I),
+    re.compile(rf"\bfalta(?:n|ría|rían)?\s+(?:que\s+)?(?:\w+\s+){{0,3}}(?:{_PENDING_VERBS})\b", re.I),
     re.compile(r"\bnos\s+(?:queda|falta)\b", re.I),
     re.compile(r"\bnext\s+step\b", re.I),
     re.compile(r"\bblocked\s+on\b", re.I),
     re.compile(r"\bwaiting\s+(?:on|for)\b", re.I),
     re.compile(r"\bneed(?:s|ed)?\s+to\b", re.I),
-    re.compile(r"-\s*\[\s\]"),  # markdown checkbox
+    # Checkbox: bare `[ ]` anywhere — covers `- [ ]`, `* [ ]`, `1. [ ]`, indented.
+    # False-positive rate empirically low (real transcripts almost never
+    # render the literal two-char sequence outside checklists).
+    re.compile(r"\[\s\]"),
 ]
 
 # Decision/action verbs (es/en) that mark commitments by the assistant.

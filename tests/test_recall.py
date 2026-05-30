@@ -137,7 +137,21 @@ def test_pending_regex_matches_actionable_only():
         "falta hacer el smoke test",
         "queda pendiente el merge",
         "queda por revisar el spec",
-        "- [ ] checklist item",
+        # broadened v3 — verbs that v2 missed
+        "falta probar el flow",
+        "falta arreglar el bug",
+        "falta documentar la API",
+        "falta corregir el typo",
+        "falta agregar el test",
+        "queda chequear los logs",
+        "queda definir el scope",
+        "queda actualizar el README",
+        # checkboxes — multiple bullet styles
+        "- [ ] dash bullet",
+        "* [ ] star bullet",
+        "1. [ ] numbered bullet",
+        "    [ ] indented",
+        # english markers
         "next step: deploy",
         "blocked on review",
         "waiting on QA",
