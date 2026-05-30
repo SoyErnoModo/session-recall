@@ -345,6 +345,31 @@ def parse_jsonl_to_digest(path: Path) -> Digest | None:
     return d
 
 
+def vacuum_cache() -> int:
+    """Remove cache entries whose `file_path` no longer exists on disk.
+
+    Returns the number of entries removed. Safe to run repeatedly.
+    """
+    if not CACHE_ROOT.exists():
+        return 0
+    removed = 0
+    for cache_file in CACHE_ROOT.glob("*.json"):
+        try:
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            src = payload.get("file_path")
+            if src and not Path(src).exists():
+                cache_file.unlink()
+                removed += 1
+        except (json.JSONDecodeError, OSError):
+            # Corrupt or unreadable — drop it too.
+            try:
+                cache_file.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def load_or_build_digest(jsonl: Path, use_cache: bool = True) -> tuple[Digest | None, bool]:
     """Return (digest, was_cache_hit).
 
@@ -665,7 +690,16 @@ def main() -> int:
         action="store_true",
         help="Print cache hit/miss stats to stderr at the end.",
     )
+    parser.add_argument(
+        "--cache-vacuum",
+        action="store_true",
+        help="Sweep cache entries whose source jsonl no longer exists.",
+    )
     args = parser.parse_args()
+
+    if args.cache_vacuum:
+        removed = vacuum_cache()
+        print(f"cache: vacuumed {removed} orphan entry/ies", file=sys.stderr)
 
     if args.cache_clear:
         if CACHE_ROOT.exists():

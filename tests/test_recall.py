@@ -6,6 +6,8 @@ import json
 import re
 import sys
 
+import pytest
+
 import recall
 
 
@@ -232,6 +234,38 @@ def test_repo_only_filter_path_traversal_safe(tmp_path, monkeypatch, capsys):
     assert "ok.js" in out
     assert "secret.js" not in out, "sibling-dir path leaked through --repo-only"
     assert ".claude/skills/foo.md" not in out
+
+
+def test_vacuum_removes_orphan_cache_entries(fake_projects, tmp_path):
+    """vacuum_cache() removes entries whose source jsonl was deleted."""
+    jsonl = fake_projects / "test-project-slug" / "sess-a.jsonl"
+    recall.load_or_build_digest(jsonl, use_cache=True)
+    cache_file = recall.cache_path_for(jsonl)
+    assert cache_file.exists()
+    # Delete the source jsonl
+    jsonl.unlink()
+    removed = recall.vacuum_cache()
+    assert removed == 1
+    assert not cache_file.exists()
+    # Idempotent
+    assert recall.vacuum_cache() == 0
+
+
+def test_cache_version_mismatch_unlinks_stale_entry(fake_projects):
+    """Bumped CACHE_VERSION should drop stale cache files, not leak them."""
+    jsonl = fake_projects / "test-project-slug" / "sess-a.jsonl"
+    recall.load_or_build_digest(jsonl, use_cache=True)
+    cache_file = recall.cache_path_for(jsonl)
+    # Forge a stale-version entry
+    payload = json.loads(cache_file.read_text())
+    payload["_v"] = -999
+    cache_file.write_text(json.dumps(payload))
+    # Trigger reload
+    _, hit = recall.load_or_build_digest(jsonl, use_cache=True)
+    assert hit is False
+    # The new entry should be on the current CACHE_VERSION
+    payload_after = json.loads(cache_file.read_text())
+    assert payload_after["_v"] == recall.CACHE_VERSION
 
 
 def test_cache_files_have_restricted_permissions(fake_projects, tmp_path):
