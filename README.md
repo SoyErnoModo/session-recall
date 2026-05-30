@@ -9,6 +9,12 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/SoyErnoModo/session-recall/actions/workflows/ci.yml"><img src="https://github.com/SoyErnoModo/session-recall/actions/workflows/ci.yml/badge.svg" alt="ci"/></a>
+  <img src="https://img.shields.io/badge/python-3.11+-008859.svg" alt="python 3.11+"/>
+  <img src="https://img.shields.io/badge/license-MIT-008859.svg" alt="MIT"/>
+</p>
+
+<p align="center">
   <a href="#instalación">Instalación</a> ·
   <a href="#cómo-se-usa">Cómo se usa</a> ·
   <a href="#qué-problema-resuelve">Problema</a> ·
