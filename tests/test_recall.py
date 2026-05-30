@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 
 import recall
 
@@ -168,6 +169,67 @@ def test_repo_only_drops_claude_home_paths(fake_projects, monkeypatch):
     # Sanity check the fixture is right
     assert "/repo/next.config.js" in files
     assert any("/.claude/skills/" in p for p in files)
+
+
+def test_repo_only_filter_path_traversal_safe(tmp_path, monkeypatch, capsys):
+    """Regression: --repo-only must NOT match sibling directories.
+
+    A naive `startswith('/repo')` against `/repo-evil/secret.js` returns
+    True. With os.path.commonpath, it returns False. This test guards
+    that fix from regressing.
+    """
+    # Build a fake "session" payload whose files_touched includes a
+    # sibling-dir path that startswith() would falsely include.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sibling = tmp_path / "repo-evil"
+    sibling.mkdir()
+    (repo / "ok.js").write_text("")
+    (sibling / "secret.js").write_text("")
+
+    projects_root = tmp_path / "projects"
+    cache_root = tmp_path / "cache"
+    pdir = projects_root / "slug"
+    pdir.mkdir(parents=True)
+
+    from tests.conftest import write_jsonl, make_event, make_tool_use
+
+    write_jsonl(
+        pdir / "s.jsonl",
+        [
+            {"type": "ai-title", "sessionId": "s", "aiTitle": "traversal probe"},
+            make_event("user", "search Next 16", ts="2026-05-29T10:00:00Z", cwd=str(repo)),
+            make_tool_use("Edit", str(repo / "ok.js")),
+            make_tool_use("Write", str(sibling / "secret.js")),
+            make_tool_use("Edit", "/home/user/.claude/skills/foo.md"),
+        ],
+    )
+
+    monkeypatch.setattr(recall, "PROJECTS_ROOT", projects_root)
+    monkeypatch.setattr(recall, "CACHE_ROOT", cache_root)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(sys, "argv", [
+        "recall.py", "Next 16", "--project=slug", "--repo-only", "--no-cache",
+    ])
+
+    rc = recall.main()
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "ok.js" in out
+    assert "secret.js" not in out, "sibling-dir path leaked through --repo-only"
+    assert ".claude/skills/foo.md" not in out
+
+
+def test_cache_files_have_restricted_permissions(fake_projects, tmp_path):
+    """Cache files store transcript bodies → must not be world-readable."""
+    import stat
+    jsonl = fake_projects / "test-project-slug" / "sess-a.jsonl"
+    recall.load_or_build_digest(jsonl, use_cache=True)
+    cache_file = recall.cache_path_for(jsonl)
+    assert cache_file.exists()
+    mode = cache_file.stat().st_mode
+    # owner-only readable+writable
+    assert stat.S_IMODE(mode) == 0o600, f"cache file mode is {oct(mode)}"
 
 
 # ─── render smoke ───────────────────────────────────────────────────────────

@@ -327,15 +327,24 @@ def parse_jsonl_to_digest(path: Path) -> Digest | None:
 
 
 def load_or_build_digest(jsonl: Path, use_cache: bool = True) -> tuple[Digest | None, bool]:
-    """Return (digest, was_cache_hit)."""
+    """Return (digest, was_cache_hit).
+
+    Cache files and the cache dir are created with mode 0600 / 0700 because
+    digests contain raw transcript content (env-var dumps, tokens, urls).
+    """
     cache_file = cache_path_for(jsonl)
     if use_cache and cache_file.exists():
         try:
             payload = json.loads(cache_file.read_text(encoding="utf-8"))
             st = jsonl.stat()
-            if (
-                payload.get("_v") == CACHE_VERSION
-                and abs(payload.get("mtime", 0) - st.st_mtime) < 1e-3
+            if payload.get("_v") != CACHE_VERSION:
+                # Version mismatch — drop stale entry so it does not linger.
+                try:
+                    cache_file.unlink()
+                except OSError:
+                    pass
+            elif (
+                abs(payload.get("mtime", 0) - st.st_mtime) < 1e-3
                 and int(payload.get("size", -1)) == st.st_size
             ):
                 return dict_to_digest(payload), True
@@ -347,9 +356,14 @@ def load_or_build_digest(jsonl: Path, use_cache: bool = True) -> tuple[Digest | 
         return None, False
     if use_cache:
         try:
-            CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-            tmp = cache_file.with_suffix(".tmp")
+            CACHE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # Per-PID tmp filename to avoid concurrent-write interleaving.
+            tmp = cache_file.with_suffix(f".{os.getpid()}.tmp")
             tmp.write_text(json.dumps(digest_to_dict(digest), ensure_ascii=False), encoding="utf-8")
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             tmp.replace(cache_file)
         except OSError:
             pass
@@ -680,12 +694,20 @@ def main() -> int:
     if args.repo_only:
         cwd_str = os.path.realpath(os.getcwd())
         claude_home = os.path.realpath(os.path.expanduser("~/.claude"))
+
+        def _under(child: str, parent: str) -> bool:
+            """True iff child resolves to a path inside parent. Sibling-safe."""
+            try:
+                return os.path.commonpath([child, parent]) == parent
+            except ValueError:
+                return False  # different drives on Windows
+
         for m in matches:
             m.files_touched = {
                 fp for fp in m.files_touched
                 if (
-                    os.path.realpath(fp).startswith(cwd_str)
-                    and not os.path.realpath(fp).startswith(claude_home)
+                    _under(os.path.realpath(fp), cwd_str)
+                    and not _under(os.path.realpath(fp), claude_home)
                 )
             }
 
