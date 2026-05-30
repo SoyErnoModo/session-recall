@@ -39,10 +39,26 @@ CACHE_ROOT = Path.home() / ".cache" / "session-recall"
 CACHE_VERSION = 2  # bump when serialized shape changes
 
 # Markers that flag "pending work" in free-text.
-# Tightened 2026-05-29: require an action-context anchor (verb/noun pair) instead of
-# matching `queda`/`falta` mid-sentence as standalone words.
-# Why: in real transcripts "queda" matched "lo que queda dicho", "Listo, queda así" —
-# noise. Now we demand the marker is followed by something that looks like a task.
+#
+# v1 → v2 (2026-05-29) tightened anchors to drop `queda`/`falta` mid-sentence
+# false positives ("Listo, queda así", "lo que queda dicho").
+# v2 → v3 (2026-05-30) broadened the action-verb whitelist after audit found
+# real-world phrasings being dropped (`falta probar/arreglar/documentar`,
+# `queda chequear/revisar`). Checkbox restored to v1's bare `[ ]` form so
+# non-dash bullets (`* [ ]`, `1. [ ]`, indented `[ ]`) also match.
+#
+# Design: anchor word + ≤3 words of slack + action verb. The verb list is
+# DRY-shared between `queda` and `falta` via `_PENDING_VERBS`.
+_PENDING_VERBS = (
+    "hacer|implementar|wirear|validar|revisar|testear|merge|mergear|deployar|"
+    "pushear|escribir|crear|completar|terminar|cerrar|chequear|investigar|"
+    "probar|arreglar|documentar|corregir|agregar|poner|subir|migrar|publicar|"
+    "actualizar|configurar|ajustar|conectar|definir|aprobar"
+)
+# Conjunctions (por, pendiente) are NOT verbs — they would let "queda así
+# por ahora" trip as a false positive. `queda por <verb>` still matches
+# because the regex allows 0-3 slack words before the action verb.
+
 PENDING_PATTERNS = [
     re.compile(r"\bTODO\b[: ]", re.I),
     re.compile(r"\bPENDING\b[: ]", re.I),
@@ -50,14 +66,17 @@ PENDING_PATTERNS = [
     re.compile(r"\bTBD\b\)?", re.I),
     re.compile(r"\bsin terminar\b", re.I),
     re.compile(r"\bquedó? pendiente\b", re.I),
-    re.compile(r"\bqueda\s+(por|pendiente|hacer|para)\b", re.I),
-    re.compile(r"\bfalta(?:n|ría|rían)?\s+(?:que\s+)?(?:\w+\s+){0,3}\b(?:hacer|implementar|wirear|validar|revisar|testear|merge|mergear|deployar|pushear|escribir|crear|completar|terminar|cerrar|chequear|investigar)\b", re.I),
+    re.compile(rf"\bqueda\s+(?:\w+\s+){{0,3}}(?:{_PENDING_VERBS})\b", re.I),
+    re.compile(rf"\bfalta(?:n|ría|rían)?\s+(?:que\s+)?(?:\w+\s+){{0,3}}(?:{_PENDING_VERBS})\b", re.I),
     re.compile(r"\bnos\s+(?:queda|falta)\b", re.I),
     re.compile(r"\bnext\s+step\b", re.I),
     re.compile(r"\bblocked\s+on\b", re.I),
     re.compile(r"\bwaiting\s+(?:on|for)\b", re.I),
     re.compile(r"\bneed(?:s|ed)?\s+to\b", re.I),
-    re.compile(r"-\s*\[\s\]"),  # markdown checkbox
+    # Checkbox: bare `[ ]` anywhere — covers `- [ ]`, `* [ ]`, `1. [ ]`, indented.
+    # False-positive rate empirically low (real transcripts almost never
+    # render the literal two-char sequence outside checklists).
+    re.compile(r"\[\s\]"),
 ]
 
 # Decision/action verbs (es/en) that mark commitments by the assistant.
@@ -326,16 +345,50 @@ def parse_jsonl_to_digest(path: Path) -> Digest | None:
     return d
 
 
+def vacuum_cache() -> int:
+    """Remove cache entries whose `file_path` no longer exists on disk.
+
+    Returns the number of entries removed. Safe to run repeatedly.
+    """
+    if not CACHE_ROOT.exists():
+        return 0
+    removed = 0
+    for cache_file in CACHE_ROOT.glob("*.json"):
+        try:
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            src = payload.get("file_path")
+            if src and not Path(src).exists():
+                cache_file.unlink()
+                removed += 1
+        except (json.JSONDecodeError, OSError):
+            # Corrupt or unreadable — drop it too.
+            try:
+                cache_file.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def load_or_build_digest(jsonl: Path, use_cache: bool = True) -> tuple[Digest | None, bool]:
-    """Return (digest, was_cache_hit)."""
+    """Return (digest, was_cache_hit).
+
+    Cache files and the cache dir are created with mode 0600 / 0700 because
+    digests contain raw transcript content (env-var dumps, tokens, urls).
+    """
     cache_file = cache_path_for(jsonl)
     if use_cache and cache_file.exists():
         try:
             payload = json.loads(cache_file.read_text(encoding="utf-8"))
             st = jsonl.stat()
-            if (
-                payload.get("_v") == CACHE_VERSION
-                and abs(payload.get("mtime", 0) - st.st_mtime) < 1e-3
+            if payload.get("_v") != CACHE_VERSION:
+                # Version mismatch — drop stale entry so it does not linger.
+                try:
+                    cache_file.unlink()
+                except OSError:
+                    pass
+            elif (
+                abs(payload.get("mtime", 0) - st.st_mtime) < 1e-3
                 and int(payload.get("size", -1)) == st.st_size
             ):
                 return dict_to_digest(payload), True
@@ -347,9 +400,14 @@ def load_or_build_digest(jsonl: Path, use_cache: bool = True) -> tuple[Digest | 
         return None, False
     if use_cache:
         try:
-            CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-            tmp = cache_file.with_suffix(".tmp")
+            CACHE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # Per-PID tmp filename to avoid concurrent-write interleaving.
+            tmp = cache_file.with_suffix(f".{os.getpid()}.tmp")
             tmp.write_text(json.dumps(digest_to_dict(digest), ensure_ascii=False), encoding="utf-8")
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             tmp.replace(cache_file)
         except OSError:
             pass
@@ -429,9 +487,17 @@ def match_digest(digest: Digest, query: Query, since: datetime | None) -> Sessio
         seen_hashes.add(h)
 
         match.hits += 1
-        snippet = text
-        for p in hit_patterns:
-            snippet = p.sub(lambda m: f"**{m.group(0)}**", snippet)
+        # Single-pass highlight to avoid double-wrapping when patterns overlap
+        # (e.g. ["Next", "Next 16"] against "Next 16 release" should not become
+        # `**Next** 16` then `**Next 16**` → `****Next 16**`).
+        if hit_patterns:
+            combined = re.compile(
+                "|".join(p.pattern for p in hit_patterns),
+                hit_patterns[0].flags,
+            )
+            snippet = combined.sub(lambda m: f"**{m.group(0)}**", text)
+        else:
+            snippet = text
         snippet = snippet.strip()[:600]
 
         if role == "user":
@@ -624,7 +690,16 @@ def main() -> int:
         action="store_true",
         help="Print cache hit/miss stats to stderr at the end.",
     )
+    parser.add_argument(
+        "--cache-vacuum",
+        action="store_true",
+        help="Sweep cache entries whose source jsonl no longer exists.",
+    )
     args = parser.parse_args()
+
+    if args.cache_vacuum:
+        removed = vacuum_cache()
+        print(f"cache: vacuumed {removed} orphan entry/ies", file=sys.stderr)
 
     if args.cache_clear:
         if CACHE_ROOT.exists():
@@ -639,8 +714,21 @@ def main() -> int:
         print("error: empty topic", file=sys.stderr)
         return 2
 
+    # Warn on logically empty queries (same term in positional and --not).
+    overlap = set(t.lower() for t in terms) & set(e.lower() for e in args.exclude)
+    if overlap:
+        print(
+            f"warning: term(s) appear in both topic and --not: {sorted(overlap)} — "
+            f"query will return zero matches.",
+            file=sys.stderr,
+        )
+
     def compile_term(s: str) -> re.Pattern:
-        return re.compile(s if args.regex else re.escape(s), re.IGNORECASE)
+        try:
+            return re.compile(s if args.regex else re.escape(s), re.IGNORECASE)
+        except re.error as exc:
+            print(f"error: invalid regex {s!r}: {exc}", file=sys.stderr)
+            sys.exit(2)
 
     query = Query()
     if args.require_all:
@@ -649,13 +737,21 @@ def main() -> int:
         query.should = [compile_term(t) for t in terms]
     query.must_not = [compile_term(t) for t in args.exclude]
 
-    display_topic = " ".join(f'"{t}"' for t in terms)
+    # Build a readable display string. Multiple --not values render as
+    # `NOT "A" NOT "B"` instead of the ambiguous `NOT "A" "B"`.
     if args.require_all and len(terms) > 1:
         display_topic = " AND ".join(f'"{t}"' for t in terms)
+    else:
+        display_topic = " ".join(f'"{t}"' for t in terms)
     if args.exclude:
-        display_topic += " NOT " + " ".join(f'"{e}"' for e in args.exclude)
+        display_topic += "".join(f' NOT "{e}"' for e in args.exclude)
 
-    since = datetime.now(timezone.utc) - timedelta(days=args.since) if args.since else None
+    # --since=0 means "today only" (sessions from the last 0 days = today).
+    # Treat negative as invalid; the `is None` guard handles `--since` omitted.
+    if args.since < 0:
+        print(f"error: --since must be >= 0, got {args.since}", file=sys.stderr)
+        return 2
+    since = datetime.now(timezone.utc) - timedelta(days=args.since)
 
     project_dirs = resolve_project_dirs(args)
     matches: list[SessionMatch] = []
@@ -680,12 +776,20 @@ def main() -> int:
     if args.repo_only:
         cwd_str = os.path.realpath(os.getcwd())
         claude_home = os.path.realpath(os.path.expanduser("~/.claude"))
+
+        def _under(child: str, parent: str) -> bool:
+            """True iff child resolves to a path inside parent. Sibling-safe."""
+            try:
+                return os.path.commonpath([child, parent]) == parent
+            except ValueError:
+                return False  # different drives on Windows
+
         for m in matches:
             m.files_touched = {
                 fp for fp in m.files_touched
                 if (
-                    os.path.realpath(fp).startswith(cwd_str)
-                    and not os.path.realpath(fp).startswith(claude_home)
+                    _under(os.path.realpath(fp), cwd_str)
+                    and not _under(os.path.realpath(fp), claude_home)
                 )
             }
 
